@@ -1,152 +1,175 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
 import ta
 import plotly.graph_objects as go
+import requests
 from datetime import datetime, timedelta
 
 # ==========================================
-# 網頁 UI 設定
+# 網頁 UI 設定 (極簡純淨版)
 # ==========================================
-st.set_page_config(page_title="動態量化交易策略 (自適應升級版)", layout="wide")
-st.title("00631L.TW 動態波動率自適應策略模型")
-st.markdown("本系統基於 Yahoo Finance 歷史數據運算。已修復原策略之參數過度配適、槓桿波動耗損及進出場不對稱缺陷。")
+st.set_page_config(page_title="正價差與價格行為防禦策略", layout="wide")
+st.title("00631L.TW 二維防禦矩陣：正價差環境 + 破底觸發")
 
-# 側邊欄參數設定區
-st.sidebar.header("動態模型參數控制面板")
-ticker = st.sidebar.text_input("分析標的 (Yahoo Finance 格式)", "00631L.TW")
-lookback_years = st.sidebar.slider("回測區間 (年)", 1, 5, 3)
+st.sidebar.subheader("資料源設定")
+finmind_token = st.sidebar.text_input("FinMind API Token", type="password")
 
-st.sidebar.subheader("波動率與停損參數")
-atr_multiplier = st.sidebar.slider("ATR 移動停利乘數", 1.5, 4.0, 2.5, step=0.1)
-hv_threshold = st.sidebar.slider("HV20 波動率濾網上限 (%)", 20, 50, 30)
-z_score_threshold = st.sidebar.slider("動態超賣 Z-Score 閾值", -3.0, -1.0, -2.0, step=0.1)
+st.sidebar.subheader("回測與顯示參數")
+lookback_years = st.sidebar.number_input("回測年數", min_value=1, max_value=10, value=5)
+plot_days = st.sidebar.slider("圖表顯示天數 (0為顯示全部)", 0, 1500, 0, step=50)
 
 # ==========================================
-# 核心運算模組
+# 資料獲取模組
 # ==========================================
 @st.cache_data
-def fetch_data(symbol, years):
-    end_date = datetime.today()
-    start_date = end_date - timedelta(days=years * 365)
-    df = yf.download(symbol, start=start_date, end=end_date)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return df.dropna()
-
-def calculate_vhf(df, period=35):
-    hcp = df['High'].rolling(period).max()
-    lcp = df['Low'].rolling(period).min()
-    diff_sum = df['Close'].diff().abs().rolling(period).sum()
-    return (hcp - lcp) / diff_sum
-
-def run_dynamic_strategy(df):
-    df = df.copy()
+def fetch_stock_data(symbol, years, token):
+    if not token: return pd.DataFrame()
+    end_date = datetime.today().strftime('%Y-%m-%d')
+    start_date = (datetime.today() - timedelta(days=years * 365)).strftime('%Y-%m-%d')
     
-    # 1. 基礎技術指標
-    df['SAR'] = ta.trend.psar_down(df['High'], df['Low'], df['Close'])
-    df.loc[df['SAR'].isna(), 'SAR'] = ta.trend.psar_up(df['High'], df['Low'], df['Close'])
-    df['VHF35'] = calculate_vhf(df, period=35).fillna(0)
+    url = "https://api.finmindtrade.com/api/v4/data"
+    parameter = {"dataset": "TaiwanStockPrice", "data_id": symbol, "start_date": start_date, "end_date": end_date, "token": token}
+    try:
+        res = requests.get(url, params=parameter, timeout=15)
+        df = pd.DataFrame(res.json().get("data", []))
+        if df.empty: return df
+        df = df.rename(columns={"date": "Date", "open": "Open", "max": "High", "min": "Low", "close": "Close"})
+        df['Date'] = pd.to_datetime(df['Date'])
+        df.set_index('Date', inplace=True)
+        for col in ['Open', 'High', 'Low', 'Close']: df[col] = pd.to_numeric(df[col], errors='coerce')
+        return df.dropna(subset=['Close'])
+    except:
+        return pd.DataFrame()
+
+@st.cache_data
+def fetch_futures_data(years, token):
+    if not token: return pd.DataFrame()
+    end_date = datetime.today().strftime('%Y-%m-%d')
+    start_date = (datetime.today() - timedelta(days=years * 365)).strftime('%Y-%m-%d')
     
-    # 2. 動態超賣指標 (Rolling Z-Score of CCI)
+    url = "https://api.finmindtrade.com/api/v4/data"
+    parameter = {"dataset": "TaiwanFuturesDaily", "data_id": "TX", "start_date": start_date, "end_date": end_date, "token": token}
+    try:
+        res = requests.get(url, params=parameter, timeout=15)
+        df = pd.DataFrame(res.json().get("data", []))
+        if df.empty: return df
+        # 篩選近月合約並取每日唯一值
+        df = df[df['contract_date'].str.len() == 6] 
+        df = df.groupby('date').first().reset_index()
+        df = df.rename(columns={"date": "Date", "close": "TX_Close"})
+        df['Date'] = pd.to_datetime(df['Date'])
+        df.set_index('Date', inplace=True)
+        return df[['TX_Close']].apply(pd.to_numeric, errors='coerce')
+    except:
+        return pd.DataFrame()
+
+# ==========================================
+# 核心策略模組
+# ==========================================
+def run_basis_strategy(df_target, df_market, df_futures):
+    df = df_target.copy()
+    
+    # 嚴格對齊日期，避免不同步導致的運算錯誤
+    df_market = df_market.reindex(df.index).ffill()
+    df_futures = df_futures.reindex(df.index).ffill()
+    
+    # --- 1. 環境濾網：正價差偵測 ---
+    df['Basis'] = df_futures['TX_Close'] - df_market['Close']
+    df['Contango_Warning'] = df['Basis'] > 0 
+    
+    # --- 2. 微觀觸發：價格破底 ---
+    df['Prev_Low'] = df['Low'].shift(1)
+    df['Prev_Contango'] = df['Contango_Warning'].shift(1)
+    df['Break_Low_Exit'] = df['Prev_Contango'] & (df['Close'] < df['Prev_Low'])
+    
+    # --- 3. 進場與總經防禦邏輯 ---
     df['CCI40'] = ta.trend.cci(df['High'], df['Low'], df['Close'], window=40)
-    cci_mean = df['CCI40'].rolling(252).mean()
-    cci_std = df['CCI40'].rolling(252).std()
-    df['CCI_Z'] = (df['CCI40'] - cci_mean) / cci_std
+    df['C1_Entry'] = df['CCI40'] < -150
     
-    # 3. 波動率濾網與停損指標 (HV20 & ATR)
-    df['HV20'] = df['Close'].pct_change().rolling(20).std() * np.sqrt(252) * 100
-    df['ATR14'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
+    psar = ta.trend.PSARIndicator(df['High'], df['Low'], df['Close'], step=0.015, max_step=0.3)
+    df['SAR'] = psar.psar()
+    df['C2_Entry'] = (df['Close'] > df['SAR']) & (df['Close'].shift(1) <= df['SAR'].shift(1))
     
-    # 4. 狀態變數平移
-    df['Close_prev'] = df['Close'].shift(1)
-    df['SAR_prev'] = df['SAR'].shift(1)
+    df['Market_MA20'] = df_market['Close'].rolling(20).mean()
+    df['Market_Bear'] = df_market['Close'] < df['Market_MA20']
     
-    # 5. 進場邏輯 (動態超賣 或 趨勢翻多，且通過波動率與趨勢濾網)
-    cond_oversold = df['CCI_Z'] < z_score_threshold
-    cond_trend_up = (df['Close'] > df['SAR']) & (df['Close_prev'] <= df['SAR_prev'])
-    cond_trend_filter = df['VHF35'] > 0.2
-    cond_volatility_safe = df['HV20'] < hv_threshold
-    
-    df['Entry_Signal'] = (cond_oversold | cond_trend_up) & cond_trend_filter & cond_volatility_safe
-    
-    # 6. 出場邏輯與部位模擬
+    # --- 4. 優先權狀態機 (每日收盤後判定) ---
     df['Position'] = 0
-    df['Action'] = ""
-    
-    in_position = False
-    entry_price = 0
-    highest_since_entry = 0
-    bars_held = 0
+    current_position = 0
     
     for i in range(1, len(df)):
-        if not in_position and df['Entry_Signal'].iloc[i]:
-            in_position = True
-            entry_price = df['Close'].iloc[i]
-            highest_since_entry = entry_price
-            bars_held = 0
-            df.iat[i, df.columns.get_loc('Action')] = "BUY"
-            
-        elif in_position:
-            bars_held += 1
-            current_close = df['Close'].iloc[i]
-            current_atr = df['ATR14'].iloc[i]
-            highest_since_entry = max(highest_since_entry, current_close)
-            
-            # 出場條件 A: 對稱性趨勢翻空
-            exit_trend = current_close < df['SAR'].iloc[i]
-            # 出場條件 B: ATR 動態移動停利/停損
-            trailing_stop_price = highest_since_entry - (atr_multiplier * current_atr)
-            exit_trailing = current_close < trailing_stop_price
-            # 出場條件 C: Time Stop (10日不漲則平倉)
-            exit_time = (bars_held > 10) and (current_close < entry_price * 1.01)
-            
-            if exit_trend or exit_trailing or exit_time:
-                in_position = False
-                df.iat[i, df.columns.get_loc('Action')] = "SELL"
-                
-        df.iat[i, df.columns.get_loc('Position')] = 1 if in_position else 0
+        c1 = df['C1_Entry'].iloc[i]
+        c2 = df['C2_Entry'].iloc[i]
+        bear = df['Market_Bear'].iloc[i]
+        take_profit = df['Break_Low_Exit'].iloc[i]
         
+        # 優先權 1: 強制清倉 (破底停利 或 大盤空頭)
+        if take_profit or bear:
+            current_position = 0
+        # 優先權 2: 放行買進 (有進場訊號 且 大盤多頭)
+        elif (c1 or c2) and not bear:
+            current_position = 1
+            
+        df.iat[i, df.columns.get_loc('Position')] = current_position
+
+    # 產生交易動作標籤
+    df['Position_Shift'] = df['Position'].diff()
+    df['Action'] = ""
+    df.loc[df['Position_Shift'] == 1, 'Action'] = "BUY (Next Open)"
+    df.loc[df['Position_Shift'] == -1, 'Action'] = "SELL (Next Open)"
+    
     return df
 
 # ==========================================
-# 執行與圖表渲染
+# 執行與圖表渲染模組
 # ==========================================
-if st.sidebar.button("執行模型運算"):
-    with st.spinner('正在從 Yahoo Finance 獲取資料並執行運算...'):
-        data = fetch_data(ticker, lookback_years)
-        if data.empty:
-            st.error("無法獲取資料，請確認標的代碼正確。")
-        else:
-            result_df = run_dynamic_strategy(data)
+if st.sidebar.button("執行正價差矩陣運算"):
+    if not finmind_token:
+        st.error("請在左側輸入 FinMind API Token。")
+    else:
+        with st.spinner('正在獲取 ETF、大盤現貨與台指期貨資料並運算模型...'):
+            df_target = fetch_stock_data("00631L", lookback_years, finmind_token)
+            df_market = fetch_stock_data("TAIEX", lookback_years, finmind_token)
+            df_futures = fetch_futures_data(lookback_years, finmind_token)
             
-            # 擷取最近100天的資料作圖以保持清晰
-            plot_df = result_df.tail(150)
-            
-            fig = go.Figure()
-            
-            # K線圖
-            fig.add_trace(go.Candlestick(x=plot_df.index, open=plot_df['Open'], high=plot_df['High'],
-                                         low=plot_df['Low'], close=plot_df['Close'], name='K線'))
-            
-            # SAR 指標
-            fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['SAR'], mode='markers', 
-                                     marker=dict(size=4, color='orange'), name='SAR'))
-            
-            # 買賣點標記
-            buys = plot_df[plot_df['Action'] == 'BUY']
-            sells = plot_df[plot_df['Action'] == 'SELL']
-            
-            fig.add_trace(go.Scatter(x=buys.index, y=buys['Low']*0.98, mode='markers',
-                                     marker=dict(symbol='triangle-up', size=12, color='green'), name='買進'))
-            fig.add_trace(go.Scatter(x=sells.index, y=sells['High']*1.02, mode='markers',
-                                     marker=dict(symbol='triangle-down', size=12, color='red'), name='賣出'))
-            
-            fig.update_layout(title=f"{ticker} 策略進出場圖表 (近150日交易日)", xaxis_title="日期", yaxis_title="價格", height=600)
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # 顯示近期訊號與數據
-            st.subheader("近期交易訊號與指標狀態")
-            display_cols = ['Close', 'HV20', 'VHF35', 'CCI_Z', 'ATR14', 'Action', 'Position']
-            st.dataframe(result_df[display_cols].tail(10).style.highlight_max(axis=0))
+            if not df_target.empty and not df_market.empty and not df_futures.empty:
+                result_df = run_basis_strategy(df_target, df_market, df_futures)
+                
+                # 控制圖表顯示天數
+                plot_df = result_df.tail(plot_days) if plot_days > 0 else result_df
+                
+                fig = go.Figure()
+                fig.add_trace(go.Candlestick(x=plot_df.index, open=plot_df['Open'], high=plot_df['High'],
+                                             low=plot_df['Low'], close=plot_df['Close'], name='00631L'))
+                
+                # 標記正價差警報
+                contango_days = plot_df[plot_df['Contango_Warning']]
+                fig.add_trace(go.Scatter(x=contango_days.index, y=contango_days['High']*1.01, mode='markers',
+                                         marker=dict(symbol='square', size=4, color='orange'), name='正價差環境'))
+                
+                # 標記買賣點
+                buys = plot_df[plot_df['Position_Shift'] == 1]
+                sells = plot_df[plot_df['Position_Shift'] == -1]
+                fig.add_trace(go.Scatter(x=buys.index, y=buys['Low']*0.98, mode='markers',
+                                         marker=dict(symbol='triangle-up', size=12, color='green'), name='觸發買進'))
+                fig.add_trace(go.Scatter(x=sells.index, y=sells['High']*1.02, mode='markers',
+                                         marker=dict(symbol='triangle-down', size=12, color='red'), name='強制平倉'))
+                
+                fig.update_layout(
+                    title=f"00631L: 正價差環境與破底觸發策略 (顯示 {plot_days if plot_days > 0 else '全部'} 交易日)", 
+                    xaxis_title="日期", yaxis_title="價格", height=650,
+                    xaxis=dict(type='date') # 確保 X 軸日期不失真
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                st.subheader("訊號監控 (近期狀態)")
+                display_cols = ['Close', 'Basis', 'Contango_Warning', 'Market_Bear', 'Break_Low_Exit', 'Position', 'Action']
+                
+                # 使用 .map() 取代已棄用的 .applymap()
+                st.dataframe(result_df[display_cols].tail(15).style.map(
+                    lambda x: 'background-color: #ffcccc' if x == 0 else ('background-color: #ccffcc' if x == 1 else ''),
+                    subset=['Position']
+                ))
+            else:
+                st.error("獲取資料失敗，請確認 API Token 是否正確或稍後再試。")
