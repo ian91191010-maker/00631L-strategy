@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 # 網頁 UI 設定
 # ==========================================
 st.set_page_config(page_title="正價差與價格行為防禦策略", layout="wide")
-st.title("00631L.TW 雙軌防禦矩陣")
+st.title("00631L.TW 審計策略")
 
 st.sidebar.subheader("資料源設定")
 finmind_token = st.sidebar.text_input("FinMind API Token", type="password")
@@ -65,7 +65,7 @@ def fetch_futures_data(years, token):
         return pd.DataFrame()
 
 # ==========================================
-# 核心策略模組 (雙軌斜率：20MA 阻斷 + 60MA 逃命)
+# 核心策略模組 (加入明日臨界閾值預判)
 # ==========================================
 def run_basis_strategy(df_target, df_market, df_futures):
     df = df_target.copy()
@@ -91,17 +91,19 @@ def run_basis_strategy(df_target, df_market, df_futures):
     df['SAR'] = psar.psar()
     df['C2_Entry'] = (df['Close'] > df['SAR']) & (df['Close'].shift(1) <= df['SAR'].shift(1))
     
-    # --- 4. 總經防禦：雙軌斜率運算 ---
+    # --- 4. 總經防禦與臨界值反推 ---
     df['Market_MA20'] = df_market['Close'].rolling(20).mean()
     df['Market_MA60'] = df_market['Close'].rolling(60).mean()
     
     df['MA20_Slope'] = df['Market_MA20'] - df['Market_MA20'].shift(3)
     df['MA60_Slope'] = df['Market_MA60'] - df['Market_MA60'].shift(3)
     
-    # 月線下彎 = 短期回檔 (阻斷進場)
     df['Market_Correction_20'] = df['MA20_Slope'] < 0 
-    # 季線下彎 = 系統性熊市 (強制清倉)
     df['Market_Bear_60'] = df['MA60_Slope'] < 0
+
+    # 【新增】：反推大盤明日若要維持均線不墜，所必須高於的「生死線 (點位)」
+    df['TAIEX_MA20_Thresh'] = df_market['Close'].shift(19) + 20 * (df['Market_MA20'].shift(2) - df['Market_MA20'])
+    df['TAIEX_MA60_Thresh'] = df_market['Close'].shift(59) + 60 * (df['Market_MA60'].shift(2) - df['Market_MA60'])
     
     # --- 5. 優先權狀態機 (三維度裁決) ---
     df['Position'] = 0
@@ -122,8 +124,6 @@ def run_basis_strategy(df_target, df_market, df_futures):
         elif (c1 or c2) and not correction_20 and not bear_60:
             current_position = 1
             
-        # 若發生 20MA 下彎但 60MA 向上：不進新單，但允許持有舊單 (繼承昨日狀態)
-            
         df.iat[i, df.columns.get_loc('Position')] = current_position
 
     # 產生交易動作標籤
@@ -142,23 +142,19 @@ if st.sidebar.button("執行矩陣策略運算"):
         st.error("執行中止：尚未輸入 FinMind API Token。")
     else:
         with st.spinner('正在獲取標的、大盤與期貨資料並執行運算...'):
-            # 正確呼叫三個資料源
             df_target = fetch_stock_data(ticker, lookback_years, finmind_token)
             df_market = fetch_stock_data("TAIEX", lookback_years, finmind_token)
             df_futures = fetch_futures_data(lookback_years, finmind_token)
             
             if not df_target.empty and not df_market.empty and not df_futures.empty:
-                # 正確將三個變數傳入新引擎
                 result_df = run_basis_strategy(df_target, df_market, df_futures)
                 
-                # 圖表顯示區間控制
                 plot_df = result_df.tail(plot_days) if plot_days > 0 else result_df
                 
                 fig = go.Figure()
                 fig.add_trace(go.Candlestick(x=plot_df.index, open=plot_df['Open'], high=plot_df['High'],
                                              low=plot_df['Low'], close=plot_df['Close'], name='K線'))
                 
-                # 標示正價差警報區間
                 contango_days = plot_df[plot_df['Contango_Warning']]
                 fig.add_trace(go.Scatter(x=contango_days.index, y=contango_days['High']*1.01, mode='markers',
                                          marker=dict(symbol='square', size=5, color='orange'), name='正價差警報'))
@@ -174,33 +170,42 @@ if st.sidebar.button("執行矩陣策略運算"):
                 fig.update_layout(title=f"{ticker} 雙軌斜率與基差防禦矩陣", xaxis_title="日期", yaxis_title="價格", height=600)
                 st.plotly_chart(fig, use_container_width=True)
                 
-                st.subheader("核心矩陣狀態監控")
-                display_cols = ['Close', 'C1_Entry', 'C2_Entry', 'Market_Correction_20', 'Market_Bear_60', 'Contango_Warning', 'Break_Low_Exit', 'Position', 'Action']
+                # ==========================================
+                # 資料表渲染 (精簡複合欄位與臨界預判)
+                # ==========================================
+                st.subheader("核心矩陣狀態監控 (含明日生死線)")
+                
+                # 擷取最後 15 筆資料並獨立複製
+                view_df = result_df.tail(15).copy()
 
-                # 擷取最後 15 筆資料並獨立複製，避免改動到原始運算資料
-                view_df = result_df[display_cols].tail(15).copy()
-
-                # 1. 日期格式化：將 DatetimeIndex 的時間尾巴消掉，只保留 YYYY-MM-DD
+                # 日期格式化
                 view_df.index = view_df.index.strftime('%Y-%m-%d')
                 view_df.index.name = '日期'
 
-                # 2. 欄位名稱中文化
+                # 【合成複合欄位】：將布林訊號與明日觸發價合併為精簡字串
+                view_df['月線(大盤)'] = view_df.apply(
+                    lambda row: f"阻斷 (需>{row['TAIEX_MA20_Thresh']:.0f})" if row['Market_Correction_20'] else f"正常 (<{row['TAIEX_MA20_Thresh']:.0f}阻斷)", axis=1)
+
+                view_df['季線(大盤)'] = view_df.apply(
+                    lambda row: f"清倉 (需>{row['TAIEX_MA60_Thresh']:.0f})" if row['Market_Bear_60'] else f"正常 (<{row['TAIEX_MA60_Thresh']:.0f}清倉)", axis=1)
+
+                view_df['正價差(正2)'] = view_df.apply(
+                    lambda row: f"警報 (<{row['Low']:.2f}逃命)" if row['Contango_Warning'] else "正常", axis=1)
+
+                # 篩選並重新命名最終要顯示的欄位
+                display_cols = ['Close', 'C1_Entry', 'C2_Entry', '月線(大盤)', '季線(大盤)', '正價差(正2)', 'Position', 'Action']
                 col_mapping = {
                     'Close': '收盤價',
                     'C1_Entry': 'CCI超賣',
                     'C2_Entry': 'SAR翻多',
-                    'Market_Correction_20': '月線示警(阻斷)',
-                    'Market_Bear_60': '季線示警(清倉)',
-                    'Contango_Warning': '正價差警報',
-                    'Break_Low_Exit': '破底觸發',
                     'Position': '倉位狀態',
                     'Action': '交易動作'
                 }
-                view_df = view_df.rename(columns=col_mapping)
+                view_df = view_df[display_cols].rename(columns=col_mapping)
 
-                # 3. 結合數值格式化 (小數點後兩位) 與 顏色標記
+                # 輸出表格
                 st.dataframe(view_df.style.format(
-                    formatter={'收盤價': '{:.2f}'}  # 強制收盤價只顯示兩位小數
+                    formatter={'收盤價': '{:.2f}'}
                 ).map(
                     lambda x: 'background-color: #ffcccc' if x == 0 else ('background-color: #ccffcc' if x == 1 else ''),
                     subset=['倉位狀態']
