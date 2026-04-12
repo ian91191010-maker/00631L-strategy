@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 # 網頁 UI 設定
 # ==========================================
 st.set_page_config(page_title="正價差與價格行為防禦策略", layout="wide")
-st.title("00631L.TW 進出場策略")
+st.title("00631L.TW 雙軌防禦矩陣")
 
 st.sidebar.subheader("資料源設定")
 finmind_token = st.sidebar.text_input("FinMind API Token", type="password")
@@ -18,6 +18,14 @@ lookback_years = st.sidebar.number_input("回測年數", min_value=1, max_value=
 plot_days = st.sidebar.slider("圖表顯示天數 (0為顯示全部)", 0, 1500, 0, step=50)
 
 ticker = "00631L"
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("資金回測與摩擦成本設定")
+bt_start_date = st.sidebar.date_input("回測起始日", datetime.strptime('2024-01-01', '%Y-%m-%d'))
+initial_capital = st.sidebar.number_input("起始投入資金 (NTD)", min_value=10000, value=100000, step=10000)
+# 預設台股手續費 0.1425%，ETF 交易稅 0.1%
+fee_rate = st.sidebar.number_input("券商單邊手續費率 (%)", value=0.1425, format="%.4f") / 100
+tax_rate = st.sidebar.number_input("ETF 賣出交易稅率 (%)", value=0.1, format="%.3f") / 100
 
 # ==========================================
 # 資料獲取模組 
@@ -207,6 +215,66 @@ def run_basis_strategy(df_target, df_taiex, df_otc, df_futures):
     return df
 
 # ==========================================
+# 資金回測模組 (導入真實稅費與整股交易模型)
+# ==========================================
+def calculate_equity_curve(df, start_date, initial_capital, fee_rate, tax_rate):
+    mask = df.index >= pd.to_datetime(start_date)
+    if not mask.any(): return pd.DataFrame()
+    
+    btest_df = df.loc[mask].copy()
+    
+    # 判斷進入回測期第一天的初始狀態 (繼承 T-1 的決策)
+    idx_start = df.index.get_indexer([pd.to_datetime(start_date)], method='bfill')[0]
+    initial_pos = df['Position'].iloc[idx_start - 1] if idx_start > 0 else 0
+    
+    cash = initial_capital
+    shares = 0
+    
+    # 若初始狀態為滿倉，第一天開盤即建倉
+    if initial_pos == 1:
+        first_open = btest_df['Adj_Open'].iloc[0]
+        # 嚴格整股計算：買進需支付手續費
+        shares = np.floor(cash / (first_open * (1 + fee_rate)))
+        if shares > 0:
+            cost = shares * first_open
+            fee = cost * fee_rate
+            cash = cash - cost - fee
+            
+    equity = []
+    
+    for i in range(len(btest_df)):
+        today_open = btest_df['Adj_Open'].iloc[i]
+        today_close = btest_df['Adj_Close'].iloc[i]
+        
+        # 檢查【昨天】的訊號，決定【今天】開盤的動作
+        if i > 0:
+            prev_action = btest_df['Action'].iloc[i-1]
+            if prev_action == "BUY" and cash > 0:
+                # 買進：扣除手續費 (使用 np.floor 確保只買整數股)
+                max_shares = np.floor(cash / (today_open * (1 + fee_rate)))
+                if max_shares > 0:
+                    cost = max_shares * today_open
+                    fee = cost * fee_rate
+                    cash = cash - cost - fee
+                    shares = max_shares
+            elif prev_action == "SELL" and shares > 0:
+                # 賣出：扣除手續費與 ETF 交易稅
+                gross_proceeds = shares * today_open
+                fee = gross_proceeds * fee_rate
+                tax = gross_proceeds * tax_rate
+                cash = cash + gross_proceeds - fee - tax
+                shares = 0
+                
+        # 結算今天盤後的總淨值 (現金 + 股票還原市值)
+        current_value = cash + (shares * today_close)
+        equity.append(current_value)
+        
+    btest_df['Equity'] = equity
+    btest_df['Drawdown'] = (btest_df['Equity'] / btest_df['Equity'].cummax()) - 1
+    
+    return btest_df
+
+# ==========================================
 # 執行與圖表渲染
 # ==========================================
 if st.sidebar.button("執行矩陣策略運算"):
@@ -226,54 +294,95 @@ if st.sidebar.button("執行矩陣策略運算"):
             if df_futures.empty: error_msgs.append("缺失 TX (台股期貨) 資料")
             
             if not error_msgs:
-                # 將 df_futures 傳入
                 result_df = run_basis_strategy(df_target, df_taiex, df_otc, df_futures)
-                # ... (下方繪圖與表格邏輯不變，但你可以把 C3_Entry 加進顯示欄位中) ...
                 
-                # --- 以下補回繪圖與表格渲染邏輯 ---
+                # ==========================================
+                # [第一區] 戰略全貌：價格行為與訊號觸發圖
+                # ==========================================
+                st.header("區域一：歷史軌跡與訊號圖表")
                 plot_df = result_df.tail(plot_days) if plot_days > 0 else result_df
                 
                 fig = go.Figure()
                 fig.add_trace(go.Candlestick(x=plot_df.index, open=plot_df['Open'], high=plot_df['High'],
-                                             low=plot_df['Low'], close=plot_df['Close'], name='K線(原價)'))
+                                             low=plot_df['Low'], close=plot_df['Close'], name='K線(實際報價)'))
                 
                 buys = plot_df[plot_df['Position_Shift'] == 1]
                 sells = plot_df[plot_df['Position_Shift'] == -1]
                 
-                fig.add_trace(go.Scatter(x=buys.index, y=buys['Low']*0.98, mode='markers',
-                                         marker=dict(symbol='triangle-up', size=12, color='green'), name='策略買進'))
-                fig.add_trace(go.Scatter(x=sells.index, y=sells['High']*1.02, mode='markers',
-                                         marker=dict(symbol='triangle-down', size=12, color='red'), name='強制清倉'))
+                # 修正未來函數錯覺，標記在收盤價，反映真實判定點
+                fig.add_trace(go.Scatter(x=buys.index, y=buys['Close'], mode='markers',
+                                         marker=dict(symbol='triangle-up', size=14, color='green'), name='收盤確認買進(次日執行)'))
+                fig.add_trace(go.Scatter(x=sells.index, y=sells['Close'], mode='markers',
+                                         marker=dict(symbol='triangle-down', size=14, color='red'), name='收盤確認強制清倉(次日執行)'))
                 
-                fig.update_layout(title=f"{ticker} 雙軌防禦矩陣 (邏輯重構版)", xaxis_title="日期", yaxis_title="價格", height=600)
+                fig.update_layout(title=f"{ticker} 雙軌防禦矩陣", xaxis_title="日期", yaxis_title="價格", height=600)
                 st.plotly_chart(fig, use_container_width=True)
                 
-                st.subheader("核心矩陣狀態監控")
+                st.divider() # 強制分隔線
+                
+                # ==========================================
+                # [第二區] 執行指令：次日操作監控表
+                # ==========================================
+                st.header("區域二：次日開盤執行監控表")
                 view_df = result_df.tail(15).copy()
                 view_df.index = view_df.index.strftime('%Y-%m-%d')
                 view_df.index.name = '日期'
-
-                # --- 雙軌顯示設定 ---
-                # 將兩種價格都四捨五入，方便閱讀
-                view_df['Close'] = view_df['Close'].round(2)
-                view_df['Adj_Close'] = view_df['Adj_Close'].round(2)
-                view_df['期現價差'] = view_df['Basis'].round(2)
 
                 # 狀態文字轉換
                 view_df['大盤與廣度(C4)'] = view_df.apply(lambda row: "空頭/流血" if row['C4_Exit'] else "健康", axis=1)
                 view_df['趨勢平滑濾網(C6)'] = view_df.apply(lambda row: "趨勢延續" if row['C6_Trend_Active'] else "盤整阻斷", axis=1)
                 view_df['籌碼觀測'] = view_df.apply(lambda row: "🔥 正價差" if row['Positive_Basis'] else "逆價差", axis=1)
 
-                # 修正：將真實收盤價(Close)放回第一列，並保留還原價(Adj_Close)供對照
+                # 前端降噪：隱藏內部運算欄位，只顯示決策資訊與實際報價
                 display_cols = ['Close', 'C1_Entry', 'C2_Entry', '大盤與廣度(C4)', 'C5_Exit', '趨勢平滑濾網(C6)', '籌碼觀測', 'Position', 'Action']
                 view_df = view_df[display_cols]
                 
-                # 終極防呆：強制重命名欄位，讓看盤直覺化
-                view_df = view_df.rename(columns={
-                    'Close': '實際報價(下單看這)',
-                })
+                view_df = view_df.rename(columns={'Close': '實際報價(下單看這)'})
 
                 st.dataframe(view_df.style.map(
                     lambda x: 'background-color: #ffcccc' if x == 0 else ('background-color: #ccffcc' if x == 1 else ''),
                     subset=['Position']
-                ))
+                ), use_container_width=True)
+                
+                st.divider() # 強制分隔線
+
+                # ==========================================
+                # [第三區] 戰略評估：實盤資金權益曲線
+                # ==========================================
+                st.header("區域三：資金績效模擬 (T+1開盤執行, 含稅費)")
+                # 傳入側邊欄設定的動態參數
+                btest_df = calculate_equity_curve(result_df, start_date=bt_start_date, 
+                                                  initial_capital=initial_capital, 
+                                                  fee_rate=fee_rate, tax_rate=tax_rate)
+                
+                if not btest_df.empty:
+                    final_equity = btest_df['Equity'].iloc[-1]
+                    max_dd = btest_df['Drawdown'].min() * 100
+                    total_return = ((final_equity / initial_capital) - 1) * 100
+                    
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("最終帳戶淨值 (NTD)", f"${final_equity:,.0f}")
+                    col2.metric("區間總報酬率", f"{total_return:.2f}%")
+                    col3.metric("最大歷史回檔 (MDD)", f"{max_dd:.2f}%")
+                    
+                    fig_eq = go.Figure()
+                    fig_eq.add_trace(go.Scatter(x=btest_df.index, y=btest_df['Equity'], 
+                                                mode='lines', name='帳戶總淨值', line=dict(color='gold', width=2)))
+                    
+                    b_points = btest_df[btest_df['Action'].shift(1) == 'BUY']
+                    s_points = btest_df[btest_df['Action'].shift(1) == 'SELL']
+                    
+                    fig_eq.add_trace(go.Scatter(x=b_points.index, y=b_points['Equity'], mode='markers',
+                                             marker=dict(symbol='triangle-up', size=10, color='green'), name='開盤買進(扣手續費)'))
+                    fig_eq.add_trace(go.Scatter(x=s_points.index, y=s_points['Equity'], mode='markers',
+                                             marker=dict(symbol='triangle-down', size=10, color='red'), name='開盤賣出(扣稅費)'))
+                    
+                    fig_eq.update_layout(title=f"系統權益曲線 (起始本金: {initial_capital:,.0f})", xaxis_title="日期", yaxis_title="淨值 (NTD)", height=400)
+                    st.plotly_chart(fig_eq, use_container_width=True)
+            
+            # --- 這是你漏掉的除錯警報器，必須嚴格對齊 if not error_msgs: ---
+            else:
+                st.error("🚨 核心資料鏈斷裂，策略中止執行。")
+                for msg in error_msgs:
+                    st.error(f"-> {msg}")
+                st.warning("若持續發生此錯誤，極可能是 FinMind API 每小時請求次數已達上限，請稍候再試。")
