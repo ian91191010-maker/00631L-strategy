@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 # 網頁 UI 設定
 # ==========================================
 st.set_page_config(page_title="正價差與價格行為防禦策略", layout="wide")
-st.title("00631L.TW 雙軌防禦矩陣")
+st.title("00631L.TW 策略分析")
 
 st.sidebar.subheader("資料源設定")
 finmind_token = st.sidebar.text_input("FinMind API Token", type="password")
@@ -141,22 +141,30 @@ def run_basis_strategy(df_target, df_taiex, df_otc, df_futures):
     df['SAR'] = psar.psar()
     df['C2_Entry'] = (df['Adj_Close'] > df['SAR']) & (df['Adj_Close'].shift(1) <= df['SAR'].shift(1))
 
+    # --- 獨立觀測指標：實質期現貨價差 (融合三維度狀態與季節性遮蔽) ---
+    # 確保期貨索引對齊
     df_futures = df_futures.reindex(df.index).ffill()
     df['Basis'] = df_futures['Futures_Close'] - df_taiex['Close']
+    
+    # 🚨 關鍵修正：引入 5 日平滑均線，消除單日籌碼雜訊 🚨
+    df['Smooth_Basis'] = df['Basis'].rolling(window=5).mean()
+    
     df['Month'] = df.index.month
     df['Is_Dividend_Season'] = df['Month'].isin([6, 7, 8])
     
     def categorize_basis(row):
-        b = row['Basis']
+        b = row['Smooth_Basis']  # 改用「平滑後的價差」來進行狀態判定
         is_div = row['Is_Dividend_Season']
         
+        if pd.isna(b): return "數據不足"
+        
         if is_div:
-            # 旺季 (6-8月)：表面數字嚴重失真，標準需動態調整
-            if b >= 20: return "極端正價差"     # 頂著幾百點除息還能正價差20點，絕對過熱
-            elif b >= 0: return "微幅正價差"    # 頂著除息還能翻正，強勢軋空
-            else: return "假性逆價差"           # 正常除息現象，不代表避險情緒
+            # 旺季 (6-8月)
+            if b >= 20: return "極端正價差"
+            elif b >= 0: return "微幅正價差"
+            else: return "假性逆價差"
         else:
-            # 非旺季 (9月~隔年5月)：嚴格套用表格定義
+            # 非旺季 (9月~隔年5月)
             if b >= 40: return "極端正價差"
             elif b >= 5: return "微幅正價差"
             elif b < 0: return "實質逆價差"
