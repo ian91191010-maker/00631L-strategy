@@ -141,11 +141,28 @@ def run_basis_strategy(df_target, df_taiex, df_otc, df_futures):
     df['SAR'] = psar.psar()
     df['C2_Entry'] = (df['Adj_Close'] > df['SAR']) & (df['Adj_Close'].shift(1) <= df['SAR'].shift(1))
 
-    # 確保期貨索引對齊
     df_futures = df_futures.reindex(df.index).ffill()
-    
     df['Basis'] = df_futures['Futures_Close'] - df_taiex['Close']
-    df['Positive_Basis'] = df['Basis'] > 0  # 純粹作為觀測標記
+    df['Month'] = df.index.month
+    df['Is_Dividend_Season'] = df['Month'].isin([6, 7, 8])
+    
+    def categorize_basis(row):
+        b = row['Basis']
+        is_div = row['Is_Dividend_Season']
+        
+        if is_div:
+            # 旺季 (6-8月)：表面數字嚴重失真，標準需動態調整
+            if b >= 20: return "極端正價差"     # 頂著幾百點除息還能正價差20點，絕對過熱
+            elif b >= 0: return "微幅正價差"    # 頂著除息還能翻正，強勢軋空
+            else: return "假性逆價差"           # 正常除息現象，不代表避險情緒
+        else:
+            # 非旺季 (9月~隔年5月)：嚴格套用表格定義
+            if b >= 40: return "極端正價差"
+            elif b >= 5: return "微幅正價差"
+            elif b < 0: return "實質逆價差"
+            else: return "平水雜訊"
+            
+    df['Basis_State'] = df.apply(categorize_basis, axis=1)
     
     # --- 2. 出場訊號 (C4 & C5) ---
     # C4 熊市偵測: 大盤週月線死叉 OR 櫃買(廣度替代)週月線死叉
@@ -353,7 +370,16 @@ if st.sidebar.button("執行矩陣策略運算"):
                 # 狀態文字轉換
                 view_df['大盤與廣度(C4)'] = view_df.apply(lambda row: "空頭/流血" if row['C4_Exit'] else "健康", axis=1)
                 view_df['趨勢平滑濾網(C6)'] = view_df.apply(lambda row: "趨勢延續" if row['C6_Trend_Active'] else "盤整阻斷", axis=1)
-                view_df['籌碼觀測'] = view_df.apply(lambda row: "🔥 正價差" if row['Positive_Basis'] else "逆價差", axis=1)
+                
+                # 完美映射表格邏輯至 UI 儀表板
+                def map_basis_ui(state):
+                    if state == "極端正價差": return "⚠️ 情緒過熱 (不宜追高)"
+                    elif state == "微幅正價差": return "🔥 軋空起手 (吃主升段)"
+                    elif state == "實質逆價差": return "🛡️ 轉倉紅利 (長線優質)"
+                    elif state == "假性逆價差": return "❄️ 除息干擾 (忽略價差)"
+                    else: return "⚖️ 價差平水 (動能不明)"
+                    
+                view_df['籌碼觀測'] = view_df['Basis_State'].apply(map_basis_ui)
 
                 # 前端降噪：隱藏內部運算欄位，只顯示決策資訊與實際報價
                 display_cols = ['Close', 'C1_Entry', 'C2_Entry', '大盤與廣度(C4)', 'C5_Exit', '趨勢平滑濾網(C6)', '籌碼觀測', 'Position', 'Action']
