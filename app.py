@@ -303,19 +303,41 @@ if st.sidebar.button("執行矩陣策略運算"):
                 plot_df = result_df.tail(plot_days) if plot_days > 0 else result_df
                 
                 fig = go.Figure()
+                
+                # --- 視覺升級 1：繪製持倉區間底色 (解決視覺斷層) ---
+                in_position = False
+                start_date = None
+
+                for date, row in plot_df.iterrows():
+                    if row['Position'] == 1 and not in_position:
+                        start_date = date
+                        in_position = True
+                    elif row['Position'] == 0 and in_position:
+                        # 畫出半透明淺綠色區塊，將整筆交易連貫起來
+                        fig.add_vrect(x0=start_date, x1=date, fillcolor="rgba(0, 200, 0, 0.15)", layer="below", line_width=0)
+                        in_position = False
+
+                # 處理圖表最右側最後一天仍持倉的邊界狀況
+                if in_position:
+                    fig.add_vrect(x0=start_date, x1=plot_df.index[-1], fillcolor="rgba(0, 200, 0, 0.15)", layer="below", line_width=0)
+
+                # --- 視覺升級 2：繪製 K 線圖 ---
                 fig.add_trace(go.Candlestick(x=plot_df.index, open=plot_df['Open'], high=plot_df['High'],
                                              low=plot_df['Low'], close=plot_df['Close'], name='K線(實際報價)'))
                 
+                # --- 視覺升級 3：強化買賣點標記 ---
                 buys = plot_df[plot_df['Position_Shift'] == 1]
                 sells = plot_df[plot_df['Position_Shift'] == -1]
                 
-                # 修正未來函數錯覺，標記在收盤價，反映真實判定點
+                # 加大 size 並加上 line 邊框，讓訊號更立體不被 K 線吃掉
                 fig.add_trace(go.Scatter(x=buys.index, y=buys['Close'], mode='markers',
-                                         marker=dict(symbol='triangle-up', size=14, color='green'), name='收盤確認買進(次日執行)'))
+                                         marker=dict(symbol='triangle-up', size=16, color='lime', line=dict(color='darkgreen', width=2)), name='買進 (建倉)'))
                 fig.add_trace(go.Scatter(x=sells.index, y=sells['Close'], mode='markers',
-                                         marker=dict(symbol='triangle-down', size=14, color='red'), name='收盤確認強制清倉(次日執行)'))
+                                         marker=dict(symbol='triangle-down', size=16, color='red', line=dict(color='darkred', width=2)), name='賣出 (清倉)'))
                 
-                fig.update_layout(title=f"{ticker} 雙軌防禦矩陣", xaxis_title="日期", yaxis_title="價格", height=600)
+                # 關閉 xaxis_rangeslider_visible 釋放圖表高度空間
+                fig.update_layout(title=f"{ticker} 雙軌防禦矩陣 (含持倉區間視覺化)", xaxis_title="日期", yaxis_title="價格", height=600,
+                                  xaxis_rangeslider_visible=False)
                 st.plotly_chart(fig, use_container_width=True)
                 
                 st.divider() # 強制分隔線
